@@ -23,8 +23,8 @@ import numpy as np
 import torch
 import torchvision as tv
 
-import bit_pytorch.lbtoolbox as lb
-import bit_pytorch.models as models
+import lbtoolbox as lb
+import models as models
 
 import bit_common
 import bit_hyperrule
