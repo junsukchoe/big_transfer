@@ -23,12 +23,21 @@ import numpy as np
 import torch
 import torchvision as tv
 
-import bit_pytorch.fewshot as fs
 import bit_pytorch.lbtoolbox as lb
 import bit_pytorch.models as models
 
 import bit_common
 import bit_hyperrule
+
+import requests
+import io
+
+
+def get_weights(bit_variant):
+    response = requests.get(
+        f'https://storage.googleapis.com/bit_models/{bit_variant}.npz')
+    response.raise_for_status()
+    return np.load(io.BytesIO(response.content))
 
 
 def topk(output, target, ks=(1,)):
@@ -81,11 +90,7 @@ def mktrainval(args, logger):
                          f"{args.dataset} dataset in the PyTorch codebase. "
                          f"In principle, it should be easy to add :)")
 
-    if args.examples_per_class is not None:
-        logger.info(
-            f"Looking for {args.examples_per_class} images per class...")
-        indices = fs.find_fewshot_indices(train_set, args.examples_per_class)
-        train_set = torch.utils.data.Subset(train_set, indices=indices)
+
 
     logger.info(f"Using a training set with {len(train_set)} images.")
     logger.info(f"Using a validation set with {len(valid_set)} images.")
@@ -176,9 +181,11 @@ def main(args):
     train_set, valid_set, train_loader, valid_loader = mktrainval(args, logger)
 
     logger.info(f"Loading model from {args.model}.npz")
-    model = models.KNOWN_MODELS[args.model](head_size=len(valid_set.classes),
-                                            zero_head=True)
-    model.load_from(np.load(f"{args.model}.npz"))
+    model = models.KNOWN_MODELS[args.model](head_size=1000,
+                                            zero_head=False)
+
+    weights = get_weights('BiT-M-R50x1-ILSVRC2012')
+    model.load_from(weights)
 
     logger.info("Moving model onto all GPUs")
     model = torch.nn.DataParallel(model)
@@ -214,76 +221,8 @@ def main(args):
 
     logger.info("Starting training!")
     chrono = lb.Chrono()
-    accum_steps = 0
-    mixup_l = np.random.beta(mixup, mixup) if mixup > 0 else 1
-    end = time.time()
 
-    with lb.Uninterrupt() as u:
-        for x, y in recycle(train_loader):
-            # measure data loading time, which is spent in the `for` statement.
-            chrono._done("load", time.time() - end)
-
-            if u.interrupted:
-                break
-
-            # Schedule sending to GPU(s)
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
-
-            # Update learning-rate, including stop training if over.
-            lr = bit_hyperrule.get_lr(step, len(train_set), args.base_lr)
-            if lr is None:
-                break
-            for param_group in optim.param_groups:
-                param_group["lr"] = lr
-
-            if mixup > 0.0:
-                x, y_a, y_b = mixup_data(x, y, mixup_l)
-
-            # compute output
-            with chrono.measure("fprop"):
-                logits = model(x)
-                if mixup > 0.0:
-                    c = mixup_criterion(cri, logits, y_a, y_b, mixup_l)
-                else:
-                    c = cri(logits, y)
-                c_num = float(
-                    c.data.cpu().numpy())  # Also ensures a sync point.
-
-            # Accumulate grads
-            with chrono.measure("grads"):
-                (c / args.batch_split).backward()
-                accum_steps += 1
-
-            accstep = f" ({accum_steps}/{args.batch_split})" if args.batch_split > 1 else ""
-            logger.info(
-                f"[step {step}{accstep}]: loss={c_num:.5f} (lr={lr:.1e})")
-            logger.flush()
-
-            # Update params
-            if accum_steps == args.batch_split:
-                with chrono.measure("update"):
-                    optim.step()
-                    optim.zero_grad()
-                step += 1
-                accum_steps = 0
-                # Sample new mixup ratio for next batch
-                mixup_l = np.random.beta(mixup, mixup) if mixup > 0 else 1
-
-                # Run evaluation and save the model.
-                if args.eval_every and step % args.eval_every == 0:
-                    run_eval(model, valid_loader, device, chrono, logger, step)
-                    if args.save:
-                        torch.save({
-                            "step": step,
-                            "model": model.state_dict(),
-                            "optim": optim.state_dict(),
-                        }, savename)
-
-            end = time.time()
-
-        # Final eval at end of training.
-        run_eval(model, valid_loader, device, chrono, logger, step='end')
+    run_eval(model, valid_loader, device, chrono, logger, step='end')
 
     logger.info(f"Timings:\n{chrono}")
 
